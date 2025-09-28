@@ -5,13 +5,14 @@ This repository contains Jupyter notebooks and scripts used in the analyses for:
 Hiebert LS, Soesbe A, Hsieh T-F, Cui Q, Yi SV. *Integrated Genomic and Methylome Profiling Reveals Promoter Repression and Age-Linked CpGs in the California Mussel*. PeerJ (in review).
 
 ## Contents
-- `01_BSseq_object_creation.ipynb` – Construction of SNP-masked BSseq objects from WGBS data.
-- `02_Global_methylation_profiles.ipynb` – Calculation of genome-wide mCG and CpG o/e correlations.
-- `03_Expression_integration.ipynb` – Integration of WGBS methylation with Salmon-derived RNA-seq expression.
-- `04_Partial_correlation_analysis.ipynb` – Promoter vs gene body methylation and expression.
-- `05_Metagene_profiles.ipynb` – Gene body/promoter methylation profiles across expression strata.
-- `06_DML_analysis.ipynb` – Age-class differential methylation testing (DSS).
-- `07_DML_annotation_visualization.ipynb` – Annotation of DMLs by genomic region and figure generation.
+- `01_ANALYSIS_Genomic_diversity_SNPs.ipynb` – Variant calling, nucleotide diversity (π, θ), and Ne estimation.
+- `02_ANALYSIS_Prep_of_bsseq_object_and_global_ave_calculation.ipynb` – BSseq object construction, SNP masking, and global methylation.
+- `03_ANALYSIS-FIG-1_CpGoe_python.ipynb` – CpG observed/expected analysis (Python version).
+- `04_ANALYSIS-FIG-1_CpGoe_R.ipynb` – CpG observed/expected analysis (R version).
+- `05_ANALYSIS-FIG-2_Methylation_across_gene_regions.ipynb` – Metagene and promoter methylation profiles.
+- `06_ANALYSIS-FIG-3_Expression.ipynb` – Promoter vs gene body methylation and expression integration.
+- `07_ANALYSIS-FIG-4_Differential_methylation.ipynb` – DSS analysis of age-associated DMLs.
+- `08_ANALYSIS-FIG-S1_Shell_length_calibration.ipynb` – Shell length–age calibration model.
 
 ## Data
 Raw sequencing reads are available at the NCBI SRA:
