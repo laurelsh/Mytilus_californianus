@@ -12,8 +12,7 @@ whole‑genome bisulfite sequencing (WGBS), and public adductor‑muscle RNA‑s
 
 ## File overview
 
-Two of the files are **command logs of terminal / cluster steps** (`.txt`) — they are
-*not* Jupyter notebooks and are not meant to be run in a kernel. The remaining files are
+Two of the files are **command logs of terminal / cluster steps** (`.txt`). The remaining files are
 Jupyter notebooks (`.ipynb`) run in Jupyter.
 
 | File | Type | What it does | Figure |
@@ -70,3 +69,6 @@ Exact package versions are printed by the "Reproducibility" cell at the end of e
   a sequence‑composition metric.
 - `_originals_backup/` holds the pre‑cleanup versions of these files and is not part of the
   analysis pipeline.
+
+ ## Citation
+If you use code or analyses from this repository, please cite the PeerJ paper once published:
