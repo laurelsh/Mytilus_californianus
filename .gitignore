@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Jupyter / Python
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Large inputs / generated outputs — uncomment if you don't want these tracked
+# data/
+# outputs/
