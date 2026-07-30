@@ -1,0 +1,146 @@
+Command log: Whole-genome sequencing (WGS), SNP calling, and diversity analyses
+
+This document records the commands and options used for WGS processing, SNP calling,
+and population genetic analyses associated with this study.
+
+------------------------------------------------------------
+Read trimming
+------------------------------------------------------------
+
+Paired-end reads were adapter- and quality-trimmed using Trim Galore (Cutadapt wrapper).
+
+trim_galore \
+  --paired \
+  --path_to_cutadapt cutadapt \
+  --output_dir <trimmed_fastq_dir> \
+  <sample>_1.fastq.gz <sample>_2.fastq.gz
+
+
+------------------------------------------------------------
+Read mapping
+------------------------------------------------------------
+
+Trimmed reads were aligned to the reference genome using Bowtie2.
+
+bowtie2 \
+  -x <bowtie2_index_prefix> \
+  -1 <sample>_1_val_1.fq.gz \
+  -2 <sample>_2_val_2.fq.gz \
+  --threads <N>
+
+
+------------------------------------------------------------
+BAM processing
+------------------------------------------------------------
+
+Mapped reads were sorted, duplicate-marked, and indexed using samtools.
+
+samtools sort \
+  -@ <N> \
+  -o <sample>.sorted.bam \
+  <sample>.sam
+
+samtools fixmate \
+  -m \
+  <sample>.sorted.bam \
+  <sample>.fixmate.bam
+
+samtools sort \
+  -o <sample>.positionsort.bam \
+  <sample>.fixmate.bam
+
+samtools markdup \
+  <sample>.positionsort.bam \
+  <sample>.mkdup.bam
+
+samtools index <sample>.mkdup.bam
+
+Alignment statistics were generated with:
+
+samtools flagstat <sample>.mkdup.bam
+
+
+------------------------------------------------------------
+Coverage estimation
+------------------------------------------------------------
+
+Per-base and summary coverage statistics were computed using mosdepth.
+
+mosdepth \
+  -t <N> \
+  <sample> \
+  <sample>.mkdup.bam
+
+
+------------------------------------------------------------
+Cohort SNP calling
+------------------------------------------------------------
+
+Cohort-level SNP calling was performed using bcftools.
+
+bcftools mpileup \
+  -f <reference.fa> \
+  --skip-indels \
+  -d 10000 \
+  -b <bam_list.txt>
+
+bcftools call \
+  -mv \
+  --variants-only
+
+bcftools view \
+  -v snps \
+  -Oz \
+  -o cohort.snps.vcf.gz
+
+tabix -p vcf cohort.snps.vcf.gz
+
+
+------------------------------------------------------------
+Per-sample SNP calling (alternative approach)
+------------------------------------------------------------
+
+As an alternative approach, per-sample SNP calling was performed using FreeBayes,
+followed by cohort merging.
+
+freebayes \
+  -f <reference.fa> \
+  <sample>.mkdup.bam
+
+bcftools view \
+  -v snps \
+  -Oz \
+  -o <sample>.snps.vcf.gz
+
+Merged across samples:
+
+bcftools merge \
+  -Oz \
+  -o merged.freebayes.snps.vcf.gz \
+  <sample1>.snps.vcf.gz <sample2>.snps.vcf.gz ...
+
+Filtered using:
+
+bcftools filter \
+  -i 'QUAL>=20 && DP>=10' \
+  -Oz \
+  -o merged.freebayes.snps.filtered.vcf.gz \
+  merged.freebayes.snps.vcf.gz
+
+
+------------------------------------------------------------
+Diversity statistics
+------------------------------------------------------------
+
+Population genetic summary statistics were computed using VCFtools.
+
+vcftools \
+  --gzvcf <cohort_snps.vcf.gz> \
+  --site-pi \
+  --out <output_prefix>
+
+vcftools \
+  --gzvcf <cohort_snps.vcf.gz> \
+  --window-pi <window_size> \
+  --out <output_prefix>
+

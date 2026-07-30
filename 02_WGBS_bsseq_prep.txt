@@ -1,0 +1,182 @@
+# Prep of bsseq object + SNP masking + global methylation summary
+
+###############################################################################
+# A) (WGBS) Merge CpG strands in Bismark coverage outputs
+###############################################################################
+# Inputs (per sample):
+#   <BISMARK_COV_DIR>/<SAMPLE>.deduplicated.bismark.cov.gz
+# Output (per sample):
+#   <BISMARK_COV_DIR>/<SAMPLE>_merged.cov   (CpG merged; 0-based)
+
+# Activate bismark environment
+conda activate bismark
+
+genome_folder="<BISMARK_GENOME_FOLDER>"           # folder passed to bismark/coverage2cytosine
+cd "<BISMARK_COV_DIR>"
+
+find *deduplicated.bismark.cov.gz \
+| xargs basename -s deduplicated.bismark.cov.gz \
+| xargs -I{} coverage2cytosine \
+  --genome_folder "${genome_folder}" \
+  --output "{}_merged.cov" \
+  --merge_CpG \
+  --zero_based \
+  "{}deduplicated.bismark.cov.gz"
+
+
+###############################################################################
+# B) (WGS) SNP calling with FreeBayes (relaxed) + merge cohort VCF
+###############################################################################
+# Inputs (per sample):
+#   <WGS_BAM_DIR>/<SAMPLE>.mkdup.bam
+# Reference:
+#   <REF_FA>
+# Outputs (per sample):
+#   <SAMPLE>.raw.vcf.gz (+ .tbi)
+# Output (cohort):
+#   snps/freebayes_relaxed_bt2.vcf.gz (+ .tbi)
+
+# Per-sample calling (ran outside notebook; repeat for each sample):
+freebayes -f "<REF_FA>" "<WGS_BAM_DIR>/<SAMPLE>.mkdup.bam" > "<SAMPLE>.raw.vcf" 2> "<SAMPLE>.freebayes.log"
+bgzip -f "<SAMPLE>.raw.vcf"
+tabix -f -p vcf "<SAMPLE>.raw.vcf.gz"
+
+# Ensure distinct sample names in VCF header (do for each VCF if needed):
+bcftools reheader -s <(echo "<SAMPLE_NAME>") -o "<SAMPLE>.fix.vcf.gz" "<SAMPLE>.raw.vcf.gz"
+mv "<SAMPLE>.fix.vcf.gz" "<SAMPLE>.raw.vcf.gz"
+tabix -f -p vcf "<SAMPLE>.raw.vcf.gz"
+
+# Merge all per-sample VCFs into a cohort VCF:
+mkdir -p snps
+bcftools merge mc*.raw.vcf.gz -Oz -o snps/freebayes_relaxed_bt2.vcf.gz
+tabix -f -p vcf snps/freebayes_relaxed_bt2.vcf.gz
+
+
+###############################################################################
+# C) Build SNP BED masks from the merged cohort VCF
+###############################################################################
+# Requirements: bcftools, tabix, bedtools
+# Outputs:
+#   snps/mask_all_snps.bed
+#   snps/mask_cpg_snps.bed  (optional heuristic CpG-only mask)
+
+# Ensure cohort VCF is indexed:
+tabix -f -p vcf snps/freebayes_relaxed_bt2.vcf.gz
+
+# (1) All-SNP mask (0-based BED, merged intervals):
+bcftools query -f'%CHROM\t%POS0\t%POS\n' snps/freebayes_relaxed_bt2.vcf.gz \
+| sort -k1,1 -k2,2n \
+| bedtools merge -i - \
+> snps/mask_all_snps.bed
+
+# (2) Optional: CpG-only SNP mask (heuristic: C>T or G>A):
+bcftools query -f'%CHROM\t%POS0\t%POS\t%REF\t%ALT\n' snps/freebayes_relaxed_bt2.vcf.gz \
+| awk '($4=="C" && $5=="T") || ($4=="G" && $5=="A") {print $1"\t"$2"\t"$3}' \
+| sort -k1,1 -k2,2n \
+| bedtools merge -i - \
+> snps/mask_cpg_snps.bed
+
+# (3) Optional variant of CpG-affecting mask (your “partner” mask block; same heuristic):
+set -euo pipefail
+VCF="snps/freebayes_relaxed_bt2.vcf.gz"
+OUT="snps/mask_all_snps_partner.bed"
+[[ -s "${VCF}.tbi" ]] || tabix -f -p vcf "$VCF"
+
+bcftools view -v snps -H "$VCF" \
+| awk 'BEGIN{OFS="\t"}{
+    chr=$1; pos=$2; ref=$4; alt=$5;
+    if ((ref=="C" && alt=="T") || (ref=="G" && alt=="A")) {
+        print chr, pos-1, pos
+    }
+}' \
+| sort -k1,1 -k2,2n \
+| bedtools merge -i - \
+> "$OUT"
+
+wc -l "$OUT" | awk '{print "BED intervals:", $1}'
+awk '{bp+=$3-$2}END{print "Total masked bp:", bp}' "$OUT"
+head -n 5 "$OUT"
+
+
+###############################################################################
+# D) R steps: build BSseq from merged WGBS cov files, then mask SNPs and summarize
+###############################################################################
+# Inputs:
+#   merged CpG evidence .cov files (pattern used in notebook):
+#     <WGBS_MERGED_COV_DIR>/*merged_CpG_evidence.cov
+#   SNP mask BED:
+#     snps/mask_all_snps.bed   (or snps/mask_cpg_snps.bed)
+# Outputs:
+#   bsseq_raw_all_samples.RData
+#   bsseq_snp_masked.RData
+#   (plus summary tables/plots as you choose)
+# Key options to preserve:
+#   - loading with data.table::fread
+#   - M = methylated reads, Cov = total reads
+#   - (optional) coverage filter for global averages (see MIN_COV below)
+
+R --vanilla <<'RSCRIPT'
+suppressMessages({
+  library(bsseq)
+  library(data.table)
+  library(dplyr)
+  library(GenomicRanges)
+})
+
+# ---- user-editable inputs (sanitized) ----
+cov_dir      <- "<WGBS_MERGED_COV_DIR>"
+cov_pattern  <- "merged_CpG_evidence\\.cov$"
+snp_bed_path <- "snps/mask_all_snps.bed"        # or "snps/mask_cpg_snps.bed"
+
+# Sample name order used in the notebook:
+sample_names <- c("M44-9-1yr","M45-11-5yr","M46-14-4yr","M47-15-6yr","M48-18-8yr","M49-19-8yr","M50-24-1yr")
+
+# ---- load & merge cov files ----
+cov_files <- list.files(path=cov_dir, pattern=cov_pattern, full.names=TRUE)
+
+read_cov <- function(file, sample) {
+  dt <- fread(file, header=FALSE)
+  # IMPORTANT: this matches your notebook column usage:
+  #   chr=V1, pos=V2, methylated=V5, unmethylated=V6
+  dt <- dt[, .(chr=V1, pos=V2, X=V5, N=V5+V6)]
+  setnames(dt, c("X","N"), c(paste0("X_", sample), paste0("N_", sample)))
+  dt
+}
+
+cov_data <- mapply(read_cov, cov_files, sample_names, SIMPLIFY=FALSE)
+combined_cov <- Reduce(function(x,y) merge(x,y, by=c("chr","pos"), all=TRUE), cov_data)
+combined_cov[is.na(combined_cov)] <- 0
+
+M   <- as.matrix(combined_cov[, grep("^X_", names(combined_cov)), with=FALSE])
+Cov <- as.matrix(combined_cov[, grep("^N_", names(combined_cov)), with=FALSE])
+colnames(M) <- colnames(Cov) <- sub("^X_", "", colnames(combined_cov)[grep("^X_", names(combined_cov))])
+
+BSseq_obj <- BSseq(chr=combined_cov$chr, pos=combined_cov$pos, M=M, Cov=Cov, sampleNames=colnames(M))
+save(BSseq_obj, file="bsseq_raw_all_samples.RData")
+
+# ---- SNP masking (remove CpGs overlapping SNP BED intervals) ----
+mask_dt <- fread(snp_bed_path, header=FALSE)
+colnames(mask_dt) <- c("chr","start","end")
+
+mask_gr <- GRanges(
+  seqnames = mask_dt$chr,
+  ranges   = IRanges(start = mask_dt$start + 1, end = mask_dt$end)  # BED->1-based
+)
+
+bs_gr <- GRanges(seqnames=seqnames(BSseq_obj), ranges=IRanges(start=pos(BSseq_obj), width=1))
+keep  <- !overlapsAny(bs_gr, mask_gr)
+BSseq_obj_masked <- BSseq_obj[keep, ]
+
+save(BSseq_obj_masked, file="bsseq_snp_masked.RData")
+
+# ---- Global methylation summaries  ----
+MIN_COV <- 4
+
+Cov_mat <- getCoverage(BSseq_obj_masked, type="Cov")
+M_mat   <- getCoverage(BSseq_obj_masked, type="M")
+
+keep_cov <- Cov_mat >= MIN_COV
+global_per_sample <- colSums(M_mat * keep_cov) / colSums(Cov_mat * keep_cov)
+
+print(data.frame(sample=colnames(Cov_mat), global_mCG=global_per_sample))
+RSCRIPT
