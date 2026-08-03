@@ -60,16 +60,6 @@ Outputs are written to `outputs/figures/` (PDFs) and `outputs/data/` (intermedia
 
 Exact package versions are printed by the "Reproducibility" cell at the end of each notebook.
 
-## Notes
-
-- Differential methylation (`07`) uses **FDR ≤ 0.05** throughout (DSS `DMLtest.multiFactor`,
-  no smoothing); z‑scoring in the heatmaps is for visualization only.
-- The proximal‑promoter window for methylation–expression analyses (`06`) is **150 bp**
-  upstream of the TSS; the CpG o/e analyses (`03`/`04`) use a wider window appropriate for
-  a sequence‑composition metric.
-- `_originals_backup/` holds the pre‑cleanup versions of these files and is not part of the
-  analysis pipeline.
-
  ## Citation
 If you use code or analyses from this repository, please cite the PeerJ paper once published:
 Hiebert LS, Soesbe A, Hsieh T-F, Cui Q, Yi SV. Integrated Genomic and Methylome Profiling in the California Mussel: Promoter Methylation Patterns and Age-Linked CpGs. PeerJ (in review).
