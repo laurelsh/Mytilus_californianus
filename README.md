@@ -22,7 +22,7 @@ Jupyter notebooks (`.ipynb`) run in Jupyter.
 | `03_CpGoe_python.ipynb` | Python | Computes CpG o/e for CDS + promoters; overlaps with WGBS methylation | inputs for Fig S1 |
 | `04_FigS1_CpGoe_vs_methylation.ipynb` | R | CpG o/e vs. mean methylation density plots | **Fig S1** |
 | `05_Fig1_metagene_by_expression.ipynb` | R | Metagene methylation profiles stratified by expression; writes `df_profile.rds` | **Fig 1** |
-| `06_Fig2_methylation_states_expression.ipynb` | R | Four promoter/gene‑body methylation states + expression + partial correlations | **Fig 2** |
+| `06_Fig2_FigS3_methylation_states_expression.ipynb` | R | Four promoter/gene‑body methylation states + expression + partial correlations | **Fig 2**  + **Fig S3** |
 | `07_Fig3_FigS2_differential_methylation.ipynb` | R | DSS differential methylation by age class (DMLs), trajectories, enrichment | **Fig 3** + **Fig S2** |
 | `08_Fig4_shell_age_calibration.ipynb` | R | GAM shell‑length → age calibration | **Fig 4** |
 
