@@ -17,7 +17,7 @@ Jupyter notebooks (`.ipynb`) run in Jupyter. Figure and table numbers below foll
 
 | File | Type | What it does | Paper |
 |---|---|---|---|
-| `01_WGS_diversity.txt` | shell command log | WGS trimming, Bowtie2 mapping, duplicate removal, coverage, cohort SNP calling, callable‑region masks, π / Watterson's θ / Tajima's D / Nₑ | Table S1 |
+| `01_WGS_diversity.txt` | shell command log | WGS trimming, Bowtie2 mapping, duplicate removal, coverage, cohort SNP calling and filtering, π / Watterson's θ / Tajima's D / Nₑ | Table S1 |
 | `02_WGBS_bsseq_prep.txt` | shell + R command log | WGBS trimming, Bismark alignment, deduplication, methylation extraction, λ conversion check, CpG strand merging, FreeBayes SNP masks; builds `bsseq_snp_masked.RData` and the global methylation values | Table S4, Table S5 |
 | `03_CpGoe_python.ipynb` | Python | CpG o/e for CDS and promoters; overlaps with WGBS methylation | inputs for Fig S1 and Fig S2 |
 | `04_FigS1_CpGoe_vs_methylation.ipynb` | R | CpG o/e vs. mean methylation density plots | **Fig S1** |
@@ -43,7 +43,8 @@ Some PDF names written by the notebooks predate the final figure order:
 `01` and `02` are the upstream terminal steps (Trim Galore, Bowtie2, Bismark, samtools, mosdepth,
 BCFtools, FreeBayes, bedtools, VCFtools, and an embedded `R --vanilla` block). They were run on the
 lab cluster to produce the input files below; **you do not run them in Jupyter.** Paths in the logs
-are placeholders (`<...>`); options and versions are those recorded in the tools' own report files.
+are placeholders (`<...>`); commands are those of the job scripts run on the server, and versions are those
+recorded in the tools' report files or installed in the environments used.
 With those inputs in place, run the notebooks in this order:
 
 ```
@@ -71,13 +72,13 @@ Outputs are written to `outputs/figures/` (PDFs) and `outputs/data/` (intermedia
 |---|---|---|
 | Read trimming (WGS, WGBS) | Trim Galore / Cutadapt | 0.6.10 / 2.6 |
 | WGBS alignment, deduplication, extraction | Bismark (Bowtie 2) | 0.24.2 |
-| WGS alignment | Bowtie2 | — |
+| WGS alignment | Bowtie2 | 2.4.1 |
 | BAM processing | Samtools | 1.13 |
-| Coverage | mosdepth | — |
+| Coverage | mosdepth | 0.3.3 |
 | Cohort SNP calling (diversity) | BCFtools | 1.21 |
 | Per‑sample SNP calling (methylation masks) | FreeBayes | 1.3.2 |
-| Interval operations | bedtools | — |
-| Diversity statistics | VCFtools | 0.1.16 |
+| Interval operations | bedtools | 2.31.1 |
+| Diversity statistics | VCFtools | 0.1.17 |
 | RNA‑seq quantification | Salmon | 1.9.0 |
 | Notebooks 04–05 | R | 4.3.3 |
 | Notebooks 06–08 | R | 4.4.1 — `DSS` 2.52.0, `bsseq` 1.40.0, `GenomicRanges` 1.56.2, `GenomicFeatures` 1.56.0, `rtracklayer` 1.64.0, `tximport` 1.32.0, `ppcor` 1.1, `mgcv` 1.9.1 |

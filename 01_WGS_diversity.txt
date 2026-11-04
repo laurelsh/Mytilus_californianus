@@ -26,7 +26,7 @@ trim_galore --output_dir <WD>/trimmed $trim_command
 ## 2. Bowtie2 mapping, fixmate, duplicate removal, index (SLURM array, one task per sample)
 ######################################################################
 # <SAMPLES_FILE>: one sample ID per line (mc9a, mc11a, ...)
-# Bowtie2 index built once with: bowtie2-build <REF_FA> <BT2_PREFIX>
+# Bowtie2 v2.4.1 and Samtools v1.13. Index built once with: bowtie2-build <REF_FA> <BT2_PREFIX>
 
 #!/usr/bin/env bash
 #SBATCH --job-name=wgs_map_bt2
@@ -57,7 +57,7 @@ rm -f "$MAPDIR/${SAMPLE}.namesorted.bam" "$MAPDIR/${SAMPLE}.fixmate.bam" "$MAPDI
 
 
 ######################################################################
-## 3. Coverage: mean depth and per-base depth (mosdepth)
+## 3. Coverage: mean depth and per-base depth (mosdepth v0.3.3)
 ######################################################################
 cd <WD>
 mkdir -p wgs_coverage_bt2
@@ -74,102 +74,59 @@ done
 
 
 ######################################################################
-## 4. Cohort SNP calling for diversity (BCFtools v1.21)
+## 4. Cohort SNP calling and filtering for diversity (BCFtools v1.21)
 ######################################################################
-# RAW = all variant SNPs; STRICT = PASS, biallelic, MAF >= 0.05, <= 20% missing (used in step 6).
 conda activate bcftools-env
-OUTDIR=<WD>/snps
-mkdir -p "$OUTDIR"
-[[ -s "<REF_FA>.fai" ]] || samtools faidx <REF_FA>
 mapfile -t BAMS < <(ls -1 <WD>/mapping_bt2/*.mkdup.bam)
 
 bcftools mpileup --threads 16 --skip-indels -d 10000 -f <REF_FA> "${BAMS[@]}" -Ou \
 | bcftools call --threads 16 --skip-variants indels --multiallelic-caller --variants-only \
-    -Oz -o "$OUTDIR/bcftools.snps.raw.vcf.gz"
-tabix -p vcf "$OUTDIR/bcftools.snps.raw.vcf.gz"
+    -Oz -o <WD>/snps/bcftools.snps.raw.vcf.gz
+tabix -p vcf <WD>/snps/bcftools.snps.raw.vcf.gz
 
-bcftools view -f PASS -v snps -m2 -M2 -Oz -o "$OUTDIR/_pg.tmp.vcf.gz" "$OUTDIR/bcftools.snps.raw.vcf.gz"
-tabix -p vcf "$OUTDIR/_pg.tmp.vcf.gz"
-bcftools +fill-tags "$OUTDIR/_pg.tmp.vcf.gz" -- -t MAF,F_MISSING,AC,AN,NS \
-  -Oz -o "$OUTDIR/bcftools.popgen.tags.vcf.gz"
-tabix -p vcf "$OUTDIR/bcftools.popgen.tags.vcf.gz"
-bcftools view -i 'MAF>=0.05 && F_MISSING<=0.20' "$OUTDIR/bcftools.popgen.tags.vcf.gz" \
-  -Oz -o "$OUTDIR/bcftools.popgen.strict.vcf.gz"
-tabix -p vcf "$OUTDIR/bcftools.popgen.strict.vcf.gz"
-rm -f "$OUTDIR/_pg.tmp.vcf.gz" "$OUTDIR/_pg.tmp.vcf.gz.tbi"
+# Biallelic SNPs with QUAL >= 30, MQ >= 30 and <= 50% missing genotypes
+# (filter chain as recorded in the output VCF header)
+bcftools +fill-tags <WD>/snps/bcftools.snps.raw.vcf.gz -Ou -- -t F_MISSING,AN,AC,MAF,NS \
+| bcftools view -m2 -M2 -v snps -Ou \
+| bcftools filter -e 'F_MISSING>0.5 || INFO/MQ<30 || QUAL<30' -Oz -o <WD>/snps/snps_filtered_bt2.vcf.gz
+tabix -p vcf <WD>/snps/snps_filtered_bt2.vcf.gz
+# 18,371,386 SNPs
 
 # Per-sample FreeBayes calls and the SNP masks for the methylation data are in
 # 02_WGBS_bsseq_prep.txt, section F.
 
 
 ######################################################################
-## 5. Callable-region masks (depth 4 to min(60, ceil(3 x mean depth)) per sample)
+## 5. Genome-wide pi, Watterson's theta, Tajima's D and Ne (Table S1; VCFtools v0.1.17)
 ######################################################################
-COVDIR=<WD>/wgs_coverage_bt2
-OUTDIR=<WD>/snps
-mapfile -t SAMPLES < <(cd "$COVDIR" && ls -1 *.per-base.bed.gz | sed 's/\.per-base\.bed\.gz$//')
-
-CALL_BEDS=()
-for s in "${SAMPLES[@]}"; do
-  mean=$(awk 'NR==2{print $4}' "$COVDIR/${s}.mosdepth.summary.txt")
-  MIN=4
-  MAX=$(python3 -c "import math; print(int(min(60, math.ceil(3*float('$mean')))))")
-  zcat "$COVDIR/${s}.per-base.bed.gz" \
-    | awk -v mn="$MIN" -v mx="$MAX" 'BEGIN{OFS="\t"} ($4>=mn && $4<=mx){print $1,$2,$3}' \
-    | bedtools sort -i stdin | bedtools merge -i stdin > "$OUTDIR/${s}.callable.bed"
-  CALL_BEDS+=("$OUTDIR/${s}.callable.bed")
-done
-
-# Union (callable in at least one sample) and intersection (callable in all samples)
-bedtools sort -i <(cat "${CALL_BEDS[@]}") | bedtools merge -i stdin > "$OUTDIR/cohort_callable_any.bed"
-cp "${CALL_BEDS[0]}" "$OUTDIR/cohort_callable_all.bed.tmp"
-for ((i=1; i<${#CALL_BEDS[@]}; i++)); do
-  bedtools intersect -a "$OUTDIR/cohort_callable_all.bed.tmp" -b "${CALL_BEDS[$i]}" > "$OUTDIR/cohort_callable_all.bed.tmp2"
-  mv "$OUTDIR/cohort_callable_all.bed.tmp2" "$OUTDIR/cohort_callable_all.bed.tmp"
-done
-mv "$OUTDIR/cohort_callable_all.bed.tmp" "$OUTDIR/cohort_callable_all.bed"
-
-
-######################################################################
-## 6. Genome-wide pi, Watterson's theta, Tajima's D and Ne (Table S1; VCFtools v0.1.16)
-######################################################################
+# Per-site statistics are divided by the full reference length (all 175 scaffolds,
+# 1,651,950,171 bp); no callable-region mask is applied.
 # Ne = pi / (4 mu), mu = 8.6e-9 per site per generation (Wooldridge et al. 2025).
 conda activate bcftools-env
-WD=<WD>
-VCF=${WD}/snps/bcftools.popgen.strict.vcf.gz
-MASK=${WD}/snps/callable_minus_snps.bed
-OUTPFX=${WD}/snps/snps_filtered_bt2
+cd <WD>
+V=snps/snps_filtered_bt2.vcf.gz
+PREFIX=snps_filtered_bt2
 MU=8.6e-9
+EFF_LEN=$(awk '{s+=$2}END{print s}' <REF_FA>.fai)
 
-# Callable, PASS, biallelic SNPs
-bcftools view -R "$MASK" -f PASS -v snps -m2 -M2 -Oz -o "${OUTPFX}.vcf.gz" "$VCF"
-tabix -p vcf "${OUTPFX}.vcf.gz"
+vcftools --gzvcf "$V" --site-pi --out "${PREFIX}_site_pi"
+vcftools --gzvcf "$V" --TajimaD ${EFF_LEN} --out "${PREFIX}_tajimaD"    # window >= scaffold: one value per scaffold
+vcftools --gzvcf "$V" --freq --out "${PREFIX}_freq"
 
-# pi (per site and in 100-kb windows)
-vcftools --gzvcf "${OUTPFX}.vcf.gz" --site-pi --out "${OUTPFX}_site_pi"
-vcftools --gzvcf "${OUTPFX}.vcf.gz" --window-pi 100000 --window-pi-step 100000 --out "${OUTPFX}_windowed_pi"
-
-# Tajima's D (100-kb windows, and one window the size of the callable length)
-vcftools --gzvcf "${OUTPFX}.vcf.gz" --TajimaD 100000 --out "${OUTPFX}_windowed_TajimaD" || true
-EFF_LEN=$(awk '{s+=$3-$2}END{print s}' "$MASK")
-vcftools --gzvcf "${OUTPFX}.vcf.gz" --TajimaD ${EFF_LEN} --out "${OUTPFX}_tajimaD" || true
-
-# Allele frequencies (segregating sites for Watterson's theta)
-vcftools --gzvcf "${OUTPFX}.vcf.gz" --freq --out "${OUTPFX}_freq"
-
-# Genome-wide summaries
-SUM_PI=$(awk 'NR>1{sum+=$3}END{printf("%.10f", sum+0)}' "${OUTPFX}_site_pi.sites.pi")
+SUM_PI=$(awk 'NR>1{sum+=$3}END{printf("%.10f", sum+0)}' "${PREFIX}_site_pi.sites.pi")
 PI_GENOME=$(python3 -c "print(f'{float(\"${SUM_PI}\")/${EFF_LEN}:.10f}')")
-SITES=$(grep -cv '^#' "${OUTPFX}_freq.frq")
-N_SAMPLES=$(bcftools query -l "${OUTPFX}.vcf.gz" | wc -l)
+D_AVG=$(awk 'NR>1 && $4!="."{sum+=$4;cnt++}END{printf("%.6f", sum/cnt)}' "${PREFIX}_tajimaD.Tajima.D")
+SITES=$(awk 'NR>1' "${PREFIX}_freq.frq" | wc -l)
+N_SAMPLES=$(bcftools query -l "$V" | wc -l)
 N_CHR=$((2 * N_SAMPLES))
 A_N=$(python3 -c "n=${N_CHR}; print(sum(1.0/i for i in range(1,n)))")
 THETA_RAW=$(python3 -c "print(f'{${SITES}/${A_N}:.10f}')")
 THETA_NORM=$(python3 -c "print(f'{${THETA_RAW}/${EFF_LEN}:.12f}')")
-D_AVG=$(awk 'NR>1 && $4!="."{sum+=$4;cnt++}END{if(cnt>0) printf("%.6f", sum/cnt); else print "NA"}' "${OUTPFX}_tajimaD.Tajima.D")
 NE=$(python3 -c "print(f'{${PI_GENOME}/(4*${MU}):.2f}')")
 
-SUMMARY=${WD}/genomewide_diversity_summary.tsv
+SUMMARY=genomewide_diversity_summary.tsv
 echo -e "PREFIX\tN_SAMPLES\tSITES\tPI_genomewide\tTHETA_W_raw\tTHETA_W_norm\tTAJIMA_D_avg\tNE(mu=${MU})\tLEN_USED" > "$SUMMARY"
-echo -e "$(basename "${OUTPFX}")\t${N_SAMPLES}\t${SITES}\t${PI_GENOME}\t${THETA_RAW}\t${THETA_NORM}\t${D_AVG}\t${NE}\t${EFF_LEN}" >> "$SUMMARY"
+echo -e "${PREFIX}\t${N_SAMPLES}\t${SITES}\t${PI_GENOME}\t${THETA_RAW}\t${THETA_NORM}\t${D_AVG}\t${NE}\t${EFF_LEN}" >> "$SUMMARY"
 column -t "$SUMMARY"
+# N_SAMPLES 7; SITES 18371386; PI_genomewide 0.0028085918; THETA_W_norm 0.0034970319;
+# TAJIMA_D_avg -0.237970; NE 81645.11; LEN_USED 1651950171

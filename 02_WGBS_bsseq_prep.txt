@@ -1,8 +1,8 @@
 # Command log: WGBS read processing, bisulfite-conversion check, SNP masking, and BSseq object
 #
 # Steps A–F were run in a terminal or as SLURM jobs on the lab server; step G is R.
-# Paths are placeholders (<...>). Tool versions and options in A–D are those recorded in the
-# per-sample Trim Galore and Bismark report files.
+# Paths are placeholders (<...>). Commands are those of the job scripts run on the server;
+# tool versions are those recorded in the per-sample Trim Galore and Bismark report files.
 #
 # WGBS libraries (Psomagen, 150-bp paired-end) and the names used in the notebooks:
 #   44-mc9a  = MC09 (M44-9-1yr)     47-mc15a = MC15 (M47-15-6yr)
@@ -44,34 +44,42 @@ bismark_genome_preparation --verbose <LAMBDA_DIR>   # folder with the lambda pha
 # Bismark defaults (directional library). Bowtie 2 options recorded in every PE report:
 #   -q --score-min L,0,-0.2 --ignore-quals --no-mixed --no-discordant --dovetail --maxins 500
 # Table S4 "cleaned read pairs" = "Sequence pairs analysed in total" in the PE report.
-# Extractor (from the splitting reports): paired-end, comprehensive output, overlapping
-# mate calls removed (Bismark default for paired-end data).
+# Overlapping mate calls are removed (Bismark default for paired-end data).
+# Run as a SLURM array, one task per library.
 
 for s in "${SAMPLES[@]}"; do
-  bismark --multicore 8 --genome <GENOME_DIR> --output_dir <MAP_DIR> \
+  bismark --multicore 3 --output_dir <MAP_DIR> --genome <GENOME_DIR> \
     -1 <TRIM_DIR>/${s}_1_val_1.fq.gz -2 <TRIM_DIR>/${s}_2_val_2.fq.gz
 
-  deduplicate_bismark --paired --output_dir <MAP_DIR> \
-    <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.bam
+  deduplicate_bismark --paired <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.bam --output_dir <MAP_DIR>
 
-  bismark_methylation_extractor --paired-end --comprehensive --bedGraph --gzip \
-    --multicore 8 --buffer_size 10G --genome_folder <GENOME_DIR> --output_dir <MAP_DIR> \
+  bismark_methylation_extractor --paired-end --multicore 3 --gzip --genome_folder <GENOME_DIR> \
+    --buffer_size 10G --cytosine_report --comprehensive --output_dir <MAP_DIR> \
     <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bam
+
+  bam2nuc --genome_folder <GENOME_DIR> --dir <MAP_DIR> <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bam
+
+  bismark2report --output <MAP_DIR> \
+    --alignment_report  <MAP_DIR>/${s}_1_val_1_bismark_bt2_PE_report.txt \
+    --dedup_report      <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplication_report.txt \
+    --splitting_report  <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated_splitting_report.txt \
+    --mbias_report      <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.M-bias.txt \
+    --nucleotide_report <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.nucleotide_stats.txt
 done
 # Output used below: <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz
+# (--cytosine_report also writes the bedGraph / .bismark.cov.gz coverage file)
 
 
 ###############################################################################
 # D) Bisulfite-conversion check on the lambda spike-in
 ###############################################################################
 # The same trimmed reads are aligned to the lambda genome, deduplicated and extracted.
-for s in "${SAMPLES[@]}"; do
-  bismark --multicore 8 --genome <LAMBDA_DIR> --output_dir <CONV_DIR> \
+for s in "${SAMPLES[@]}"; do        # SLURM array, one task per library
+  bismark --multicore 3 --output_dir <CONV_DIR> --genome <LAMBDA_DIR> \
     -1 <TRIM_DIR>/${s}_1_val_1.fq.gz -2 <TRIM_DIR>/${s}_2_val_2.fq.gz
-  deduplicate_bismark --paired --output_dir <CONV_DIR> \
-    <CONV_DIR>/${s}_1_val_1_bismark_bt2_pe.bam
-  bismark_methylation_extractor --paired-end --gzip --multicore 8 \
-    --genome_folder <LAMBDA_DIR> --output_dir <CONV_DIR> \
+  deduplicate_bismark --paired <CONV_DIR>/${s}_1_val_1_bismark_bt2_pe.bam --output_dir <CONV_DIR>
+  bismark_methylation_extractor --paired-end --multicore 3 --gzip --genome_folder <LAMBDA_DIR> \
+    --buffer_size 10G --cytosine_report --comprehensive --output_dir <CONV_DIR> \
     <CONV_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bam
 done
 
@@ -117,40 +125,36 @@ done
 ###############################################################################
 # WGS BAMs (<WGS_BAM_DIR>/<SAMPLE>.mkdup.bam) come from 01_WGS_diversity.txt, steps 1–2.
 
-# (1) Per-sample FreeBayes calls (FreeBayes v1.3.2; default settings; no quality filter)
+# (1) Per-sample FreeBayes calls (FreeBayes v1.3.2, default settings, no quality filter;
+#     SLURM array, one task per BAM)
 conda activate freebayes
-for bam in <WGS_BAM_DIR>/*.mkdup.bam; do
-  s=$(basename "$bam" .mkdup.bam)
-  freebayes -f <REF_FA> "$bam" > "${s}.raw.vcf" 2> "${s}.freebayes.log"
-  bgzip -f "${s}.raw.vcf"
-  tabix -f -p vcf "${s}.raw.vcf.gz"
-  # give each VCF a distinct sample name if needed:
-  #   bcftools reheader -s <(echo "$s") -o "${s}.fix.vcf.gz" "${s}.raw.vcf.gz"
-  #   mv "${s}.fix.vcf.gz" "${s}.raw.vcf.gz"; tabix -f -p vcf "${s}.raw.vcf.gz"
+cd <WGS_BAM_DIR>
+for BAM in *.mkdup.bam; do
+  SAMPLE="${BAM%%.mkdup.bam}"
+  freebayes -f <REF_FA> "$BAM" > "${SAMPLE}.raw.vcf" 2> "${SAMPLE}.freebayes.log"
+  bgzip -f "${SAMPLE}.raw.vcf"
+  tabix -p vcf "${SAMPLE}.raw.vcf.gz"
 done
 
-# (2) Merge into one cohort VCF (no further quality filtering, so masking is inclusive)
-mkdir -p snps
-bcftools merge mc*.raw.vcf.gz -Oz -o snps/freebayes_relaxed_bt2.vcf.gz
-tabix -f -p vcf snps/freebayes_relaxed_bt2.vcf.gz
+# (2) Merge into one cohort VCF (BCFtools v1.21; no further quality filtering, so masking is inclusive)
+conda activate bcftools-env
+bcftools merge mc*.raw.vcf.gz -Oz -o <WD>/snps/freebayes_relaxed_bt2.vcf.gz
+tabix -f -p vcf <WD>/snps/freebayes_relaxed_bt2.vcf.gz
 
-# (3) CpG-affecting mask: C>T and G>A SNPs as 1-bp BED intervals (0-based, merged).
+# (3) CpG-affecting mask: multiallelic records split, then C>T and G>A SNPs written as
+#     1-bp BED intervals (0-based), sorted and merged (bedtools v2.31.1).
 #     This is the mask applied to the BSseq object in G.
+cd <WD>
 VCF=snps/freebayes_relaxed_bt2.vcf.gz
+TMP=snps/mask_partner.tmp.bed
 OUT=snps/mask_all_snps_partner.bed
-bcftools view -v snps -H "$VCF" \
-| awk 'BEGIN{OFS="\t"}{
-    chr=$1; pos=$2; ref=$4; alt=$5;
-    if ((ref=="C" && alt=="T") || (ref=="G" && alt=="A")) {
-        print chr, pos-1, pos
-    }
-}' \
-| sort -k1,1 -k2,2n \
-| bedtools merge -i - \
-> "$OUT"
-gzip -k "$OUT"                                   # -> snps/mask_all_snps_partner.bed.gz
-wc -l "$OUT" | awk '{print "BED intervals:", $1}'
-awk '{bp+=$3-$2}END{print "Total masked bp:", bp}' "$OUT"
+bcftools norm -m -any -Ou "$VCF" \
+| bcftools view -v snps -i '((REF="C" && ALT="T") || (REF="G" && ALT="A"))' -Ou \
+| bcftools query -f '%CHROM\t%POS0\t%POS\n' \
+| LC_ALL=C sort -k1,1 -k2,2n > "$TMP"
+bedtools merge -i "$TMP" > "$OUT"
+bgzip -f "$OUT"                                  # -> snps/mask_all_snps_partner.bed.gz
+tabix -f -p bed "${OUT}.gz"
 
 # (4) SNP filter for the notebook 03 tables (E). These tables were filtered earlier (2024)
 #     against a bcftools cohort SNP set, removing CpGs whose C position matched a called SNP.
