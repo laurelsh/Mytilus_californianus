@@ -88,4 +88,4 @@ The full session and package versions are printed by the "Reproducibility" cell 
 
 ## Citation
 If you use code or analyses from this repository, please cite the PeerJ paper once published:
-Hiebert LS, Soesbe A, Hsieh T-F, Cui Q, Yi SV. Integrated Genomic and Methylome Profiling in the California Mussel: Promoter Methylation Patterns and Age-Linked CpGs. PeerJ (in review).
+Hiebert LS, Soesbe A, Hsieh T-F, Cui Q, Yi SV. The DNA methylation landscape of the California mussel (*Mytilus californianus*) and its associations with gene expression and age. PeerJ (in review).
