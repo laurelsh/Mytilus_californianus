@@ -1,146 +1,175 @@
-Command log: Whole-genome sequencing (WGS), SNP calling, and diversity analyses
+# Command log: WGS read processing, SNP calling, and diversity / Ne (Table S1)
+#
+# All steps were run in a terminal or as SLURM jobs on the lab server. Paths are placeholders (<...>).
+# Samples (WGS, Psomagen, 150-bp paired-end): mc9a mc11a mc14a mc15a mc18a mc19a mc24a (= MC09 ... MC24)
+# <WD> is the WGS working directory; <REF_FA> is mytilus_californianus_genome.fasta (GCF_021869535.1).
 
-This document records the commands and options used for WGS processing, SNP calling,
-and population genetic analyses associated with this study.
-
-------------------------------------------------------------
-Read trimming
-------------------------------------------------------------
-
-Paired-end reads were adapter- and quality-trimmed using Trim Galore (Cutadapt wrapper).
-
-trim_galore \
-  --paired \
-  --path_to_cutadapt cutadapt \
-  --output_dir <trimmed_fastq_dir> \
-  <sample>_1.fastq.gz <sample>_2.fastq.gz
+SAMPLES=(mc9a mc11a mc14a mc15a mc18a mc19a mc24a)
 
 
-------------------------------------------------------------
-Read mapping
-------------------------------------------------------------
+######################################################################
+## 1. Adapter and quality trimming (Trim Galore v0.6.10, Cutadapt v2.6)
+######################################################################
+# Defaults, as recorded in the trimming reports: Phred quality cutoff 20; adapter auto-detected
+# (Illumina TruSeq, AGATCGGAAGAGC); stringency 1 bp; error rate 0.1; pairs removed if either read < 20 bp.
 
-Trimmed reads were aligned to the reference genome using Bowtie2.
-
-bowtie2 \
-  -x <bowtie2_index_prefix> \
-  -1 <sample>_1_val_1.fq.gz \
-  -2 <sample>_2_val_2.fq.gz \
-  --threads <N>
-
-
-------------------------------------------------------------
-BAM processing
-------------------------------------------------------------
-
-Mapped reads were sorted, duplicate-marked, and indexed using samtools.
-
-samtools sort \
-  -@ <N> \
-  -o <sample>.sorted.bam \
-  <sample>.sam
-
-samtools fixmate \
-  -m \
-  <sample>.sorted.bam \
-  <sample>.fixmate.bam
-
-samtools sort \
-  -o <sample>.positionsort.bam \
-  <sample>.fixmate.bam
-
-samtools markdup \
-  <sample>.positionsort.bam \
-  <sample>.mkdup.bam
-
-samtools index <sample>.mkdup.bam
-
-Alignment statistics were generated with:
-
-samtools flagstat <sample>.mkdup.bam
+conda activate trim-galore
+trim_command=""
+for s in "${SAMPLES[@]}"; do
+  trim_command="$trim_command --paired <RAW_DIR>/${s}/${s}_1.fastq.gz <RAW_DIR>/${s}/${s}_2.fastq.gz"
+done
+trim_galore --output_dir <WD>/trimmed $trim_command
+# Output: <WD>/trimmed/${s}_1_val_1.fq.gz, ${s}_2_val_2.fq.gz
 
 
-------------------------------------------------------------
-Coverage estimation
-------------------------------------------------------------
+######################################################################
+## 2. Bowtie2 mapping, fixmate, duplicate removal, index (SLURM array, one task per sample)
+######################################################################
+# <SAMPLES_FILE>: one sample ID per line (mc9a, mc11a, ...)
+# Bowtie2 index built once with: bowtie2-build <REF_FA> <BT2_PREFIX>
 
-Per-base and summary coverage statistics were computed using mosdepth.
+#!/usr/bin/env bash
+#SBATCH --job-name=wgs_map_bt2
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=64G
+#SBATCH --time=1-00:00:00
+#SBATCH --array=1-7
+set -euo pipefail
 
-mosdepth \
-  -t <N> \
-  <sample> \
-  <sample>.mkdup.bam
+SAMPLE="$(sed -n "${SLURM_ARRAY_TASK_ID}p" <SAMPLES_FILE>)"
+R1="<WD>/trimmed/${SAMPLE}_1_val_1.fq.gz"
+R2="<WD>/trimmed/${SAMPLE}_2_val_2.fq.gz"
+MAPDIR="<WD>/mapping_bt2"
+T=${SLURM_CPUS_PER_TASK}
+mkdir -p "$MAPDIR/tmp_${SAMPLE}"
 
+bowtie2 -x <BT2_PREFIX> -1 "$R1" -2 "$R2" -p "$T" 2> "$MAPDIR/${SAMPLE}.bt2.log" \
+| samtools view -b -@ "$T" \
+| samtools sort -n -@ "$T" -m 2G -T "$MAPDIR/tmp_${SAMPLE}/nsort" -o "$MAPDIR/${SAMPLE}.namesorted.bam"
 
-------------------------------------------------------------
-Cohort SNP calling
-------------------------------------------------------------
+samtools fixmate -@ "$T" -m "$MAPDIR/${SAMPLE}.namesorted.bam" "$MAPDIR/${SAMPLE}.fixmate.bam"
+samtools sort    -@ "$T" -o "$MAPDIR/${SAMPLE}.coordsorted.bam" "$MAPDIR/${SAMPLE}.fixmate.bam"
+samtools markdup -@ "$T" -r "$MAPDIR/${SAMPLE}.coordsorted.bam" "$MAPDIR/${SAMPLE}.mkdup.bam"   # -r: remove duplicates
+samtools index   -@ "$T" "$MAPDIR/${SAMPLE}.mkdup.bam"
+samtools flagstat -@ "$T" "$MAPDIR/${SAMPLE}.mkdup.bam" > "$MAPDIR/${SAMPLE}.flagstat.txt"
 
-Cohort-level SNP calling was performed using bcftools.
-
-bcftools mpileup \
-  -f <reference.fa> \
-  --skip-indels \
-  -d 10000 \
-  -b <bam_list.txt>
-
-bcftools call \
-  -mv \
-  --variants-only
-
-bcftools view \
-  -v snps \
-  -Oz \
-  -o cohort.snps.vcf.gz
-
-tabix -p vcf cohort.snps.vcf.gz
+rm -f "$MAPDIR/${SAMPLE}.namesorted.bam" "$MAPDIR/${SAMPLE}.fixmate.bam" "$MAPDIR/${SAMPLE}.coordsorted.bam"
 
 
-------------------------------------------------------------
-Per-sample SNP calling (alternative approach)
-------------------------------------------------------------
+######################################################################
+## 3. Coverage: mean depth and per-base depth (mosdepth)
+######################################################################
+cd <WD>
+mkdir -p wgs_coverage_bt2
+for b in mapping_bt2/*.mkdup.bam; do
+  s=$(basename "$b" .mkdup.bam)
+  mosdepth --fast-mode --threads 8 "wgs_coverage_bt2/${s}" "$b"   # no -n, so *.per-base.bed.gz is written
+done
 
-As an alternative approach, per-sample SNP calling was performed using FreeBayes,
-followed by cohort merging.
-
-freebayes \
-  -f <reference.fa> \
-  <sample>.mkdup.bam
-
-bcftools view \
-  -v snps \
-  -Oz \
-  -o <sample>.snps.vcf.gz
-
-Merged across samples:
-
-bcftools merge \
-  -Oz \
-  -o merged.freebayes.snps.vcf.gz \
-  <sample1>.snps.vcf.gz <sample2>.snps.vcf.gz ...
-
-Filtered using:
-
-bcftools filter \
-  -i 'QUAL>=20 && DP>=10' \
-  -Oz \
-  -o merged.freebayes.snps.filtered.vcf.gz \
-  merged.freebayes.snps.vcf.gz
+echo -e "Sample\tMeanDepth"
+for f in wgs_coverage_bt2/*.mosdepth.summary.txt; do
+  s=$(basename "$f" .mosdepth.summary.txt)
+  awk -v s="$s" 'NR==2 {print s "\t" $4}' "$f"
+done
 
 
-------------------------------------------------------------
-Diversity statistics
-------------------------------------------------------------
+######################################################################
+## 4. Cohort SNP calling for diversity (BCFtools v1.21)
+######################################################################
+# RAW = all variant SNPs; STRICT = PASS, biallelic, MAF >= 0.05, <= 20% missing (used in step 6).
+conda activate bcftools-env
+OUTDIR=<WD>/snps
+mkdir -p "$OUTDIR"
+[[ -s "<REF_FA>.fai" ]] || samtools faidx <REF_FA>
+mapfile -t BAMS < <(ls -1 <WD>/mapping_bt2/*.mkdup.bam)
 
-Population genetic summary statistics were computed using VCFtools.
+bcftools mpileup --threads 16 --skip-indels -d 10000 -f <REF_FA> "${BAMS[@]}" -Ou \
+| bcftools call --threads 16 --skip-variants indels --multiallelic-caller --variants-only \
+    -Oz -o "$OUTDIR/bcftools.snps.raw.vcf.gz"
+tabix -p vcf "$OUTDIR/bcftools.snps.raw.vcf.gz"
 
-vcftools \
-  --gzvcf <cohort_snps.vcf.gz> \
-  --site-pi \
-  --out <output_prefix>
+bcftools view -f PASS -v snps -m2 -M2 -Oz -o "$OUTDIR/_pg.tmp.vcf.gz" "$OUTDIR/bcftools.snps.raw.vcf.gz"
+tabix -p vcf "$OUTDIR/_pg.tmp.vcf.gz"
+bcftools +fill-tags "$OUTDIR/_pg.tmp.vcf.gz" -- -t MAF,F_MISSING,AC,AN,NS \
+  -Oz -o "$OUTDIR/bcftools.popgen.tags.vcf.gz"
+tabix -p vcf "$OUTDIR/bcftools.popgen.tags.vcf.gz"
+bcftools view -i 'MAF>=0.05 && F_MISSING<=0.20' "$OUTDIR/bcftools.popgen.tags.vcf.gz" \
+  -Oz -o "$OUTDIR/bcftools.popgen.strict.vcf.gz"
+tabix -p vcf "$OUTDIR/bcftools.popgen.strict.vcf.gz"
+rm -f "$OUTDIR/_pg.tmp.vcf.gz" "$OUTDIR/_pg.tmp.vcf.gz.tbi"
 
-vcftools \
-  --gzvcf <cohort_snps.vcf.gz> \
-  --window-pi <window_size> \
-  --out <output_prefix>
+# Per-sample FreeBayes calls and the SNP masks for the methylation data are in
+# 02_WGBS_bsseq_prep.txt, section F.
 
+
+######################################################################
+## 5. Callable-region masks (depth 4 to min(60, ceil(3 x mean depth)) per sample)
+######################################################################
+COVDIR=<WD>/wgs_coverage_bt2
+OUTDIR=<WD>/snps
+mapfile -t SAMPLES < <(cd "$COVDIR" && ls -1 *.per-base.bed.gz | sed 's/\.per-base\.bed\.gz$//')
+
+CALL_BEDS=()
+for s in "${SAMPLES[@]}"; do
+  mean=$(awk 'NR==2{print $4}' "$COVDIR/${s}.mosdepth.summary.txt")
+  MIN=4
+  MAX=$(python3 -c "import math; print(int(min(60, math.ceil(3*float('$mean')))))")
+  zcat "$COVDIR/${s}.per-base.bed.gz" \
+    | awk -v mn="$MIN" -v mx="$MAX" 'BEGIN{OFS="\t"} ($4>=mn && $4<=mx){print $1,$2,$3}' \
+    | bedtools sort -i stdin | bedtools merge -i stdin > "$OUTDIR/${s}.callable.bed"
+  CALL_BEDS+=("$OUTDIR/${s}.callable.bed")
+done
+
+# Union (callable in at least one sample) and intersection (callable in all samples)
+bedtools sort -i <(cat "${CALL_BEDS[@]}") | bedtools merge -i stdin > "$OUTDIR/cohort_callable_any.bed"
+cp "${CALL_BEDS[0]}" "$OUTDIR/cohort_callable_all.bed.tmp"
+for ((i=1; i<${#CALL_BEDS[@]}; i++)); do
+  bedtools intersect -a "$OUTDIR/cohort_callable_all.bed.tmp" -b "${CALL_BEDS[$i]}" > "$OUTDIR/cohort_callable_all.bed.tmp2"
+  mv "$OUTDIR/cohort_callable_all.bed.tmp2" "$OUTDIR/cohort_callable_all.bed.tmp"
+done
+mv "$OUTDIR/cohort_callable_all.bed.tmp" "$OUTDIR/cohort_callable_all.bed"
+
+
+######################################################################
+## 6. Genome-wide pi, Watterson's theta, Tajima's D and Ne (Table S1; VCFtools v0.1.16)
+######################################################################
+# Ne = pi / (4 mu), mu = 8.6e-9 per site per generation (Wooldridge et al. 2025).
+conda activate bcftools-env
+WD=<WD>
+VCF=${WD}/snps/bcftools.popgen.strict.vcf.gz
+MASK=${WD}/snps/callable_minus_snps.bed
+OUTPFX=${WD}/snps/snps_filtered_bt2
+MU=8.6e-9
+
+# Callable, PASS, biallelic SNPs
+bcftools view -R "$MASK" -f PASS -v snps -m2 -M2 -Oz -o "${OUTPFX}.vcf.gz" "$VCF"
+tabix -p vcf "${OUTPFX}.vcf.gz"
+
+# pi (per site and in 100-kb windows)
+vcftools --gzvcf "${OUTPFX}.vcf.gz" --site-pi --out "${OUTPFX}_site_pi"
+vcftools --gzvcf "${OUTPFX}.vcf.gz" --window-pi 100000 --window-pi-step 100000 --out "${OUTPFX}_windowed_pi"
+
+# Tajima's D (100-kb windows, and one window the size of the callable length)
+vcftools --gzvcf "${OUTPFX}.vcf.gz" --TajimaD 100000 --out "${OUTPFX}_windowed_TajimaD" || true
+EFF_LEN=$(awk '{s+=$3-$2}END{print s}' "$MASK")
+vcftools --gzvcf "${OUTPFX}.vcf.gz" --TajimaD ${EFF_LEN} --out "${OUTPFX}_tajimaD" || true
+
+# Allele frequencies (segregating sites for Watterson's theta)
+vcftools --gzvcf "${OUTPFX}.vcf.gz" --freq --out "${OUTPFX}_freq"
+
+# Genome-wide summaries
+SUM_PI=$(awk 'NR>1{sum+=$3}END{printf("%.10f", sum+0)}' "${OUTPFX}_site_pi.sites.pi")
+PI_GENOME=$(python3 -c "print(f'{float(\"${SUM_PI}\")/${EFF_LEN}:.10f}')")
+SITES=$(grep -cv '^#' "${OUTPFX}_freq.frq")
+N_SAMPLES=$(bcftools query -l "${OUTPFX}.vcf.gz" | wc -l)
+N_CHR=$((2 * N_SAMPLES))
+A_N=$(python3 -c "n=${N_CHR}; print(sum(1.0/i for i in range(1,n)))")
+THETA_RAW=$(python3 -c "print(f'{${SITES}/${A_N}:.10f}')")
+THETA_NORM=$(python3 -c "print(f'{${THETA_RAW}/${EFF_LEN}:.12f}')")
+D_AVG=$(awk 'NR>1 && $4!="."{sum+=$4;cnt++}END{if(cnt>0) printf("%.6f", sum/cnt); else print "NA"}' "${OUTPFX}_tajimaD.Tajima.D")
+NE=$(python3 -c "print(f'{${PI_GENOME}/(4*${MU}):.2f}')")
+
+SUMMARY=${WD}/genomewide_diversity_summary.tsv
+echo -e "PREFIX\tN_SAMPLES\tSITES\tPI_genomewide\tTHETA_W_raw\tTHETA_W_norm\tTAJIMA_D_avg\tNE(mu=${MU})\tLEN_USED" > "$SUMMARY"
+echo -e "$(basename "${OUTPFX}")\t${N_SAMPLES}\t${SITES}\t${PI_GENOME}\t${THETA_RAW}\t${THETA_NORM}\t${D_AVG}\t${NE}\t${EFF_LEN}" >> "$SUMMARY"
+column -t "$SUMMARY"

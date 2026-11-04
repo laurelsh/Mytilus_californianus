@@ -1,87 +1,143 @@
-# Prep of bsseq object + SNP masking + global methylation summary
+# Command log: WGBS read processing, bisulfite-conversion check, SNP masking, and BSseq object
+#
+# Steps A–F were run in a terminal or as SLURM jobs on the lab server; step G is R.
+# Paths are placeholders (<...>). Tool versions and options in A–D are those recorded in the
+# per-sample Trim Galore and Bismark report files.
+#
+# WGBS libraries (Psomagen, 150-bp paired-end) and the names used in the notebooks:
+#   44-mc9a  = MC09 (M44-9-1yr)     47-mc15a = MC15 (M47-15-6yr)
+#   45-mc11a = MC11 (M45-11-5yr)    48-mc18a = MC18 (M48-18-8yr)
+#   46-mc14a = MC14 (M46-14-4yr)    49-mc19a = MC19 (M49-19-8yr)
+#                                   50-mc24a = MC24 (M50-24-1yr)
+# Libraries 44–46 and 47–50 were prepared in two batches (see Methods, Table S4).
+
+SAMPLES=(44-mc9a 45-mc11a 46-mc14a 47-mc15a 48-mc18a 49-mc19a 50-mc24a)
+
 
 ###############################################################################
-# A) (WGBS) Merge CpG strands in Bismark coverage outputs
+# A) Adapter and quality trimming (Trim Galore v0.6.10, Cutadapt v2.6)
 ###############################################################################
-# Inputs (per sample):
-#   <BISMARK_COV_DIR>/<SAMPLE>.deduplicated.bismark.cov.gz
-# Output (per sample):
-#   <BISMARK_COV_DIR>/<SAMPLE>_merged.cov   (CpG merged; 0-based)
+# Defaults, as recorded in the trimming reports: Phred quality cutoff 20; adapter
+# auto-detected (Illumina TruSeq, AGATCGGAAGAGC); stringency 1 bp; error rate 0.1;
+# pairs removed if either read is < 20 bp.
+# Table S4 "raw read pairs" = "Total reads processed" in each *_1 trimming report.
 
-# Activate bismark environment
+conda activate trim-galore
+for s in "${SAMPLES[@]}"; do
+  trim_galore --paired --output_dir <TRIM_DIR> \
+    <RAW_DIR>/${s}_1.fastq.gz <RAW_DIR>/${s}_2.fastq.gz
+done
+# Output: <TRIM_DIR>/${s}_1_val_1.fq.gz, <TRIM_DIR>/${s}_2_val_2.fq.gz (+ trimming reports)
+
+
+###############################################################################
+# B) Bisulfite genome preparation (Bismark v0.24.2)
+###############################################################################
 conda activate bismark
+bismark_genome_preparation --verbose <GENOME_DIR>   # folder with mytilus_californianus_genome.fasta (GCF_021869535.1)
+bismark_genome_preparation --verbose <LAMBDA_DIR>   # folder with the lambda phage genome (NEB N3013 spike-in)
 
-genome_folder="<BISMARK_GENOME_FOLDER>"           # folder passed to bismark/coverage2cytosine
-cd "<BISMARK_COV_DIR>"
 
+###############################################################################
+# C) Alignment, deduplication and methylation extraction (Bismark v0.24.2)
+###############################################################################
+# Bismark defaults (directional library). Bowtie 2 options recorded in every PE report:
+#   -q --score-min L,0,-0.2 --ignore-quals --no-mixed --no-discordant --dovetail --maxins 500
+# Table S4 "cleaned read pairs" = "Sequence pairs analysed in total" in the PE report.
+# Extractor (from the splitting reports): paired-end, comprehensive output, overlapping
+# mate calls removed (Bismark default for paired-end data).
+
+for s in "${SAMPLES[@]}"; do
+  bismark --multicore 8 --genome <GENOME_DIR> --output_dir <MAP_DIR> \
+    -1 <TRIM_DIR>/${s}_1_val_1.fq.gz -2 <TRIM_DIR>/${s}_2_val_2.fq.gz
+
+  deduplicate_bismark --paired --output_dir <MAP_DIR> \
+    <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.bam
+
+  bismark_methylation_extractor --paired-end --comprehensive --bedGraph --gzip \
+    --multicore 8 --buffer_size 10G --genome_folder <GENOME_DIR> --output_dir <MAP_DIR> \
+    <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bam
+done
+# Output used below: <MAP_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bismark.cov.gz
+
+
+###############################################################################
+# D) Bisulfite-conversion check on the lambda spike-in
+###############################################################################
+# The same trimmed reads are aligned to the lambda genome, deduplicated and extracted.
+for s in "${SAMPLES[@]}"; do
+  bismark --multicore 8 --genome <LAMBDA_DIR> --output_dir <CONV_DIR> \
+    -1 <TRIM_DIR>/${s}_1_val_1.fq.gz -2 <TRIM_DIR>/${s}_2_val_2.fq.gz
+  deduplicate_bismark --paired --output_dir <CONV_DIR> \
+    <CONV_DIR>/${s}_1_val_1_bismark_bt2_pe.bam
+  bismark_methylation_extractor --paired-end --gzip --multicore 8 \
+    --genome_folder <LAMBDA_DIR> --output_dir <CONV_DIR> \
+    <CONV_DIR>/${s}_1_val_1_bismark_bt2_pe.deduplicated.bam
+done
+
+# Conversion rate (Table S4) = 100 x (1 - methylated C / all C), summed over the CpG, CHG
+# and CHH contexts of each lambda splitting report.
+for r in <CONV_DIR>/*_pe.deduplicated_splitting_report.txt; do
+  awk -F'\t' -v s="$(basename "${r%%_1_val_1*}")" '
+    /^Total methylated C.s in (CpG|CHG|CHH) context/ {m += $2}
+    /^Total C to T conversions in (CpG|CHG|CHH) context/ {u += $2}
+    END {printf "%s\t%.1f%%\n", s, 100 * (1 - m / (m + u))}' "$r"
+done
+# Output: 44-mc9a 98.6%, 45-mc11a 98.7%, 46-mc14a 98.6%, 47-mc15a 99.7%,
+#         48-mc18a 99.7%, 49-mc19a 99.7%, 50-mc24a 99.7%
+
+
+###############################################################################
+# E) Merge CpG strands (Bismark coverage2cytosine)
+###############################################################################
+# Output (per sample): <MAP_DIR>/<SAMPLE>_merged.cov.CpG_report.merged_CpG_evidence.cov
+# (0-based; columns chr, start, end, % methylation, methylated count, unmethylated count)
+
+cd <MAP_DIR>
 find *deduplicated.bismark.cov.gz \
 | xargs basename -s deduplicated.bismark.cov.gz \
 | xargs -I{} coverage2cytosine \
-  --genome_folder "${genome_folder}" \
+  --genome_folder <GENOME_DIR> \
   --output "{}_merged.cov" \
   --merge_CpG \
   --zero_based \
   "{}deduplicated.bismark.cov.gz"
 
+# Per-sample tables with >= 4 reads, used as the WGBS input of notebook 03 (data/wgbs/):
+for f in *merged_CpG_evidence.cov; do
+  STEM=$(basename "${f}" .CpG_report.merged_CpG_evidence.cov)
+  awk -F $'\t' 'BEGIN {OFS = FS} {if ($5+$6 >= 4) {print $1, $2, $3, $4, $5, $6}}' "${f}" \
+  > "${STEM}"_4x.tab
+done
+# These tables were then SNP-filtered and gzipped (*_merged.cov_4x.tab.gz); see F(4).
+
 
 ###############################################################################
-# B) (WGS) SNP calling with FreeBayes (relaxed) + merge cohort VCF
+# F) SNP masks from the WGS data
 ###############################################################################
-# Inputs (per sample):
-#   <WGS_BAM_DIR>/<SAMPLE>.mkdup.bam
-# Reference:
-#   <REF_FA>
-# Outputs (per sample):
-#   <SAMPLE>.raw.vcf.gz (+ .tbi)
-# Output (cohort):
-#   snps/freebayes_relaxed_bt2.vcf.gz (+ .tbi)
+# WGS BAMs (<WGS_BAM_DIR>/<SAMPLE>.mkdup.bam) come from 01_WGS_diversity.txt, steps 1–2.
 
-# Per-sample calling (ran outside notebook; repeat for each sample):
-freebayes -f "<REF_FA>" "<WGS_BAM_DIR>/<SAMPLE>.mkdup.bam" > "<SAMPLE>.raw.vcf" 2> "<SAMPLE>.freebayes.log"
-bgzip -f "<SAMPLE>.raw.vcf"
-tabix -f -p vcf "<SAMPLE>.raw.vcf.gz"
+# (1) Per-sample FreeBayes calls (FreeBayes v1.3.2; default settings; no quality filter)
+conda activate freebayes
+for bam in <WGS_BAM_DIR>/*.mkdup.bam; do
+  s=$(basename "$bam" .mkdup.bam)
+  freebayes -f <REF_FA> "$bam" > "${s}.raw.vcf" 2> "${s}.freebayes.log"
+  bgzip -f "${s}.raw.vcf"
+  tabix -f -p vcf "${s}.raw.vcf.gz"
+  # give each VCF a distinct sample name if needed:
+  #   bcftools reheader -s <(echo "$s") -o "${s}.fix.vcf.gz" "${s}.raw.vcf.gz"
+  #   mv "${s}.fix.vcf.gz" "${s}.raw.vcf.gz"; tabix -f -p vcf "${s}.raw.vcf.gz"
+done
 
-# Ensure distinct sample names in VCF header (do for each VCF if needed):
-bcftools reheader -s <(echo "<SAMPLE_NAME>") -o "<SAMPLE>.fix.vcf.gz" "<SAMPLE>.raw.vcf.gz"
-mv "<SAMPLE>.fix.vcf.gz" "<SAMPLE>.raw.vcf.gz"
-tabix -f -p vcf "<SAMPLE>.raw.vcf.gz"
-
-# Merge all per-sample VCFs into a cohort VCF:
+# (2) Merge into one cohort VCF (no further quality filtering, so masking is inclusive)
 mkdir -p snps
 bcftools merge mc*.raw.vcf.gz -Oz -o snps/freebayes_relaxed_bt2.vcf.gz
 tabix -f -p vcf snps/freebayes_relaxed_bt2.vcf.gz
 
-
-###############################################################################
-# C) Build SNP BED masks from the merged cohort VCF
-###############################################################################
-# Requirements: bcftools, tabix, bedtools
-# Outputs:
-#   snps/mask_all_snps.bed
-#   snps/mask_cpg_snps.bed  (optional heuristic CpG-only mask)
-
-# Ensure cohort VCF is indexed:
-tabix -f -p vcf snps/freebayes_relaxed_bt2.vcf.gz
-
-# (1) All-SNP mask (0-based BED, merged intervals):
-bcftools query -f'%CHROM\t%POS0\t%POS\n' snps/freebayes_relaxed_bt2.vcf.gz \
-| sort -k1,1 -k2,2n \
-| bedtools merge -i - \
-> snps/mask_all_snps.bed
-
-# (2) Optional: CpG-only SNP mask (heuristic: C>T or G>A):
-bcftools query -f'%CHROM\t%POS0\t%POS\t%REF\t%ALT\n' snps/freebayes_relaxed_bt2.vcf.gz \
-| awk '($4=="C" && $5=="T") || ($4=="G" && $5=="A") {print $1"\t"$2"\t"$3}' \
-| sort -k1,1 -k2,2n \
-| bedtools merge -i - \
-> snps/mask_cpg_snps.bed
-
-# (3) Optional variant of CpG-affecting mask (your “partner” mask block; same heuristic):
-set -euo pipefail
-VCF="snps/freebayes_relaxed_bt2.vcf.gz"
-OUT="snps/mask_all_snps_partner.bed"
-[[ -s "${VCF}.tbi" ]] || tabix -f -p vcf "$VCF"
-
+# (3) CpG-affecting mask: C>T and G>A SNPs as 1-bp BED intervals (0-based, merged).
+#     This is the mask applied to the BSseq object in G.
+VCF=snps/freebayes_relaxed_bt2.vcf.gz
+OUT=snps/mask_all_snps_partner.bed
 bcftools view -v snps -H "$VCF" \
 | awk 'BEGIN{OFS="\t"}{
     chr=$1; pos=$2; ref=$4; alt=$5;
@@ -92,91 +148,119 @@ bcftools view -v snps -H "$VCF" \
 | sort -k1,1 -k2,2n \
 | bedtools merge -i - \
 > "$OUT"
-
+gzip -k "$OUT"                                   # -> snps/mask_all_snps_partner.bed.gz
 wc -l "$OUT" | awk '{print "BED intervals:", $1}'
 awk '{bp+=$3-$2}END{print "Total masked bp:", bp}' "$OUT"
-head -n 5 "$OUT"
+
+# (4) SNP filter for the notebook 03 tables (E). These tables were filtered earlier (2024)
+#     against a bcftools cohort SNP set, removing CpGs whose C position matched a called SNP.
+#     SNP set: the trimmed WGS reads (01, step 1) aligned with Bismark v0.24.2 to <GENOME_DIR>
+#     (bismark --genome <GENOME_DIR> -1 ... -2 ... --bam), then samtools sort -n, fixmate -m, sort,
+#     markdup -r and index, giving <WGS_BAM_DIR_2024>/<SAMPLE>_sorted_markdup.bam:
+bcftools mpileup --threads 8 --skip-indels -d 10000 -f <REF_FA> -o snps/snps-raw.bcf <WGS BAMs>
+bcftools index snps/snps-raw.bcf
+bcftools call --threads 8 --skip-variants indels --multiallelic-caller --variants-only \
+  -O z -o snps/snps.vcf.gz snps/snps-raw.bcf
+gunzip -k snps/snps.vcf.gz
+
+R --vanilla <<'RSCRIPT'
+library(dplyr)
+vcf_file <- "snps/snps.vcf"
+metadata_lines <- sum(grepl("^##", readLines(vcf_file)))
+ct <- read.csv(vcf_file, header = FALSE, sep = "\t", skip = metadata_lines + 1, comment.char = "#") %>%
+  mutate(loci = paste0(V1, "_", V2))
+for (file in list.files("<MAP_DIR>", pattern = "_4x.tab$", full.names = TRUE)) {
+  data <- read.csv(file, header = FALSE, sep = "\t")
+  modified_data <- data %>%
+    mutate(loci = paste0(V1, "_", V2 + 1)) %>%     # 0-based start -> 1-based VCF POS
+    anti_join(ct, by = "loci") %>%
+    select(-loci)
+  write.table(modified_data, file = file.path("<SNPS_REMOVED_DIR>", basename(file)),
+              sep = "\t", row.names = FALSE, quote = FALSE, col.names = FALSE)
+}
+RSCRIPT
+gzip <SNPS_REMOVED_DIR>/*_4x.tab                  # -> data/wgbs/*_merged.cov_4x.tab.gz for notebook 03
 
 
 ###############################################################################
-# D) R steps: build BSseq from merged WGBS cov files, then mask SNPs and summarize
+# G) R: build the BSseq object, apply the SNP mask, global methylation (Table S5)
 ###############################################################################
-# Inputs:
-#   merged CpG evidence .cov files (pattern used in notebook):
-#     <WGBS_MERGED_COV_DIR>/*merged_CpG_evidence.cov
-#   SNP mask BED:
-#     snps/mask_all_snps.bed   (or snps/mask_cpg_snps.bed)
-# Outputs:
-#   bsseq_raw_all_samples.RData
-#   bsseq_snp_masked.RData
-#   (plus summary tables/plots as you choose)
-# Key options to preserve:
-#   - loading with data.table::fread
-#   - M = methylated reads, Cov = total reads
-#   - (optional) coverage filter for global averages (see MIN_COV below)
+# Inputs:  <MAP_DIR>/*merged_CpG_evidence.cov (E); snps/mask_all_snps_partner.bed.gz (F3)
+# Outputs: bsseq_raw_all_samples.RData       (7 samples, unmasked)
+#          bsseq_snp_masked.RData            (6 samples, masked; data/ input of notebooks 05–07)
+#          bsseq_snp_masked_all_samples.RData (7 samples, masked; Table S5)
 
 R --vanilla <<'RSCRIPT'
 suppressMessages({
   library(bsseq)
   library(data.table)
-  library(dplyr)
   library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(rtracklayer)
 })
 
-# ---- user-editable inputs (sanitized) ----
-cov_dir      <- "<WGBS_MERGED_COV_DIR>"
-cov_pattern  <- "merged_CpG_evidence\\.cov$"
-snp_bed_path <- "snps/mask_all_snps.bed"        # or "snps/mask_cpg_snps.bed"
+cov_dir      <- "<MAP_DIR>"
+snp_bed_path <- "snps/mask_all_snps_partner.bed.gz"
+min_meth_cov <- 4
 
-# Sample name order used in the notebook:
-sample_names <- c("M44-9-1yr","M45-11-5yr","M46-14-4yr","M47-15-6yr","M48-18-8yr","M49-19-8yr","M50-24-1yr")
-
-# ---- load & merge cov files ----
-cov_files <- list.files(path=cov_dir, pattern=cov_pattern, full.names=TRUE)
+## ---- Load and merge the per-sample merged-CpG .cov files ----
+cov_files    <- list.files(path = cov_dir, pattern = "merged_CpG_evidence\\.cov$", full.names = TRUE)
+sample_names <- c("M44-9-1yr", "M45-11-5yr", "M46-14-4yr", "M47-15-6yr", "M48-18-8yr", "M49-19-8yr", "M50-24-1yr")
 
 read_cov <- function(file, sample) {
-  dt <- fread(file, header=FALSE)
-  # IMPORTANT: this matches your notebook column usage:
-  #   chr=V1, pos=V2, methylated=V5, unmethylated=V6
-  dt <- dt[, .(chr=V1, pos=V2, X=V5, N=V5+V6)]
-  setnames(dt, c("X","N"), c(paste0("X_", sample), paste0("N_", sample)))
-  dt
+  dt <- fread(file, header = FALSE)
+  dt <- dt[, .(chr = V1, pos = V2, X = V5, N = V5 + V6)]
+  setnames(dt, c("X", "N"), c(paste0("X_", sample), paste0("N_", sample)))
+  return(dt)
 }
 
-cov_data <- mapply(read_cov, cov_files, sample_names, SIMPLIFY=FALSE)
-combined_cov <- Reduce(function(x,y) merge(x,y, by=c("chr","pos"), all=TRUE), cov_data)
+cov_data <- mapply(read_cov, cov_files, sample_names, SIMPLIFY = FALSE)
+combined_cov <- Reduce(function(x, y) merge(x, y, by = c("chr", "pos"), all = TRUE), cov_data)
 combined_cov[is.na(combined_cov)] <- 0
 
-M   <- as.matrix(combined_cov[, grep("^X_", names(combined_cov)), with=FALSE])
-Cov <- as.matrix(combined_cov[, grep("^N_", names(combined_cov)), with=FALSE])
+## ---- Raw BSseq object (7 samples) ----
+M   <- as.matrix(combined_cov[, grep("^X_", names(combined_cov)), with = FALSE])
+Cov <- as.matrix(combined_cov[, grep("^N_", names(combined_cov)), with = FALSE])
 colnames(M) <- colnames(Cov) <- sub("^X_", "", colnames(combined_cov)[grep("^X_", names(combined_cov))])
+BSseq_obj <- BSseq(chr = combined_cov$chr, pos = combined_cov$pos, M = M, Cov = Cov, sampleNames = colnames(M))
+save(BSseq_obj, file = "bsseq_raw_all_samples.RData")
 
-BSseq_obj <- BSseq(chr=combined_cov$chr, pos=combined_cov$pos, M=M, Cov=Cov, sampleNames=colnames(M))
-save(BSseq_obj, file="bsseq_raw_all_samples.RData")
-
-# ---- SNP masking (remove CpGs overlapping SNP BED intervals) ----
-mask_dt <- fread(snp_bed_path, header=FALSE)
-colnames(mask_dt) <- c("chr","start","end")
-
-mask_gr <- GRanges(
-  seqnames = mask_dt$chr,
-  ranges   = IRanges(start = mask_dt$start + 1, end = mask_dt$end)  # BED->1-based
+## ---- Remove the WGBS coverage outlier (fewest CpGs with >= 4 reads: M45-11-5yr = MC11) ----
+cov_stats <- data.frame(
+  sample = sampleNames(BSseq_obj),
+  covered_4x = sapply(seq_len(ncol(BSseq_obj)), function(i) sum(getCoverage(BSseq_obj, type = "Cov")[, i] >= min_meth_cov))
 )
+outlier_sample <- cov_stats$sample[which.min(cov_stats$covered_4x)]
+BSseq_obj_clean <- BSseq_obj[, !(sampleNames(BSseq_obj) %in% outlier_sample)]
 
-bs_gr <- GRanges(seqnames=seqnames(BSseq_obj), ranges=IRanges(start=pos(BSseq_obj), width=1))
-keep  <- !overlapsAny(bs_gr, mask_gr)
-BSseq_obj_masked <- BSseq_obj[keep, ]
+## ---- SNP mask helper: drop CpGs overlapping the partner mask ----
+mask_bsseq <- function(bs, mask) {
+  shared <- intersect(seqlevels(bs), seqlevels(mask))
+  mask <- keepSeqlevels(mask, shared, pruning.mode = "coarse")
+  bs   <- keepSeqlevels(bs,   shared, pruning.mode = "coarse")
+  genome(mask) <- genome(bs)
+  hits <- countOverlaps(granges(bs), mask, type = "any")
+  cat("Total loci:", length(hits), "\nOverlap:", sum(hits > 0), "\nRetained:", sum(hits == 0), "\n")
+  bs[hits == 0, ]
+}
+mask <- import(snp_bed_path)
 
-save(BSseq_obj_masked, file="bsseq_snp_masked.RData")
+## ---- 6-sample masked object (input of notebooks 05, 06, 07) ----
+BSseq_obj_masked <- mask_bsseq(BSseq_obj_clean, mask)
+save(BSseq_obj_masked, file = "bsseq_snp_masked.RData")
+# Total loci: 27531884 / Overlap: 429099 / Retained: 27102785
 
-# ---- Global methylation summaries  ----
-MIN_COV <- 4
+## ---- 7-sample masked object and global methylation (Table S5) ----
+BSseq_obj_masked7 <- mask_bsseq(BSseq_obj, mask)
+stopifnot(ncol(BSseq_obj_masked7) == 7)
+save(BSseq_obj_masked7, file = "bsseq_snp_masked_all_samples.RData")
 
-Cov_mat <- getCoverage(BSseq_obj_masked, type="Cov")
-M_mat   <- getCoverage(BSseq_obj_masked, type="M")
-
-keep_cov <- Cov_mat >= MIN_COV
-global_per_sample <- colSums(M_mat * keep_cov) / colSums(Cov_mat * keep_cov)
-
-print(data.frame(sample=colnames(Cov_mat), global_mCG=global_per_sample))
+meth_mat <- getMeth(BSseq_obj_masked7, type = "raw")   # mCG/CG per CpG and sample (NA where uncovered)
+global_mean <- mean(meth_mat, na.rm = TRUE) * 100
+global_per_sample <- colMeans(meth_mat, na.rm = TRUE) * 100
+print(global_mean)
+print(global_per_sample)
+# 11.48458
+# M44-9-1yr M45-11-5yr M46-14-4yr M47-15-6yr M48-18-8yr M49-19-8yr M50-24-1yr
+# 12.503574  13.848951  12.718962  11.325192  10.297695  10.004323   9.951701
 RSCRIPT
